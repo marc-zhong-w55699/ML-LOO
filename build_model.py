@@ -1,556 +1,382 @@
-from __future__ import absolute_import, division, print_function 
-import tensorflow as tf
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+
 import numpy as np
-import os
-from keras.layers import Flatten, Conv2D, MaxPooling2D, Conv2DTranspose, UpSampling2D, Convolution2D, BatchNormalization, Dense, Dropout, Activation, Embedding, Conv1D, Input, GlobalMaxPooling1D, Multiply, Lambda, Permute, GlobalAveragePooling2D 
-from keras.preprocessing import sequence
-from keras.datasets import imdb, mnist
-from keras.callbacks import ModelCheckpoint
-from keras.models import Model, Sequential
-from keras.objectives import binary_crossentropy
-from keras.metrics import binary_accuracy as accuracy
-from keras.optimizers import RMSprop
-from keras import backend as K  
-from keras import optimizers
 import math
-
-
-def construct_original_network(dataset_name, model_name, train): 
-	data_model = dataset_name + model_name
-	if dataset_name == 'mnist': 
-		input_size = 28
-		num_classes = 10
-		channel = 1
-
-
-	elif dataset_name == 'cifar10':
-		# Define the model 
-		input_size = 32
-		num_classes = 10
-		channel = 3
-
-	elif dataset_name == 'cifar100':
-		# Define the model 
-		input_size = 32
-		num_classes = 100
-		channel = 3		
-
-	if model_name == 'scnn':
-		image_ph = Input(shape=(input_size,input_size,channel),dtype = 'float32')
-		net = Convolution2D(32, kernel_size=(5, 5),padding = 'same',
-				 activation='relu', name = 'conv1')(image_ph)
-		net = MaxPooling2D(pool_size=(2, 2))(net)
-		net = Convolution2D(64, (5, 5),padding = 'same',
-				 activation='relu', name = 'conv2')(net)
-		net = MaxPooling2D(pool_size=(2, 2))(net) 
-
-		net = Flatten()(net)
-		net = Dense(1024, activation='relu',name='fc1')(net) 
-		net = Dense(num_classes, activation='softmax',name='fc2')(net) 
-		preds = Activation('softmax')(net) 
-		model = Model(image_ph, preds)
-
-		model.compile(loss='categorical_crossentropy',
-					  optimizer='adam',
-					  metrics=['acc']) 
-
-	elif model_name == 'cnn':
-		image_ph = Input(shape=(input_size,input_size,channel),dtype = 'float32')
-		net = Convolution2D(48, (3,3), padding='same', input_shape=(32, 32, 3))(image_ph)
-		net = Activation('relu')(net)
-		net = Convolution2D(48, (3, 3))(net)
-		net = Activation('relu')(net)
-		net = MaxPooling2D(pool_size=(2, 2))(net)
-		net = Dropout(0.25)(net)
-		net = Convolution2D(96, (3,3), padding='same')(net)
-		net = Activation('relu')(net)
-		net = Convolution2D(96, (3, 3))(net)
-		net = Activation('relu')(net)
-		net = MaxPooling2D(pool_size=(2, 2))(net)
-		net = Dropout(0.25)(net)
-		net = Convolution2D(192, (3,3), padding='same')(net)
-		net = Activation('relu')(net)
-		net = Convolution2D(192, (3, 3))(net)
-		net = Activation('relu')(net)
-		net = MaxPooling2D(pool_size=(2, 2))(net)
-		net = Dropout(0.25)(net)
-		net = Flatten()(net)
-		net = Dense(512)(net)
-		net = Activation('relu')(net)
-		net = Dropout(0.5)(net)
-		net = Dense(256)(net)
-		net = Activation('relu')(net)
-		net = Dropout(0.5)(net)
-		net = Dense(num_classes, activation=None)(net)
-		preds = Activation('softmax')(net)
-
-		model = Model(image_ph, preds)
-		sgd = optimizers.SGD(lr=0.01, decay=1e-6, momentum=0.9, nesterov=True)
-
-		model.compile(loss='categorical_crossentropy',
-						  optimizer=sgd,
-						  metrics=['acc'])
-
-		# Compile the model
-	elif model_name == 'fc':
-		image_ph = Input(shape=(input_size,input_size,channel),dtype = 'float32')
-		net = Flatten()(image_ph)
-		net = Dense(256)(net)
-		net = Activation('relu')(net)
-		
-		net = Dense(256)(net)
-		net = Activation('relu')(net)
-
-		net = Dense(256)(net)
-		net = Activation('relu')(net)
-		
-		preds = Dense(num_classes, activation='softmax')(net)
-
-		model = Model(image_ph, preds)
-		sgd = optimizers.SGD(lr=0.01, decay=1e-6, momentum=0.9, nesterov=True)
-
-		model.compile(loss='categorical_crossentropy',
-						  optimizer=sgd,
-						  metrics=['acc'])
-
-	elif model_name == 'resnet':
-		from resnet import resnet_v2, lr_schedule,  lr_schedule_sgd
-		
-		model, image_ph, preds = resnet_v2(input_shape=(input_size, input_size, channel), depth=20, num_classes = num_classes)
-
-		optimizer = optimizers.SGD(lr=0.1, momentum=0.9, nesterov=True)
-
-
-		model.compile(loss='categorical_crossentropy',
-				  optimizer=optimizer,
-				  metrics=['accuracy'])
-
-	elif model_name == 'densenet':
-		from densenet import DenseNet 
-		nb_filter = -1#12 if dataset_name == 'cifar100' else -1
-		
-		image_ph = Input(shape=(input_size,input_size,channel),dtype = 'float32')
-		model, preds = DenseNet((input_size,input_size,channel), 
-			classes=num_classes, depth=40, nb_dense_block=3, growth_rate=12, nb_filter=nb_filter, dropout_rate=0.0, weights=None, input_tensor = image_ph)
-			
-		optimizer = optimizers.SGD(lr=0.1, momentum=0.9, nesterov=True)
-
-
-		model.compile(loss='categorical_crossentropy', optimizer=optimizer, metrics=["accuracy"])
-
-	grads = []
-	for c in range(num_classes):
-		grads.append(tf.gradients(preds[:,c], image_ph))
-
-	grads = tf.concat(grads, axis = 0)
-	approxs = grads * tf.expand_dims(image_ph, 0)
-
-	logits = [layer.output for layer in model.layers][-2]
-	print(logits)
-		
-	sess = K.get_session()
-
-	return image_ph, preds, grads, approxs, sess, model, num_classes, logits
-
-
-class ImageModel():
-	def __init__(self, model_name, dataset_name, train = False, load = False, **kwargs):
-		self.model_name = model_name
-		self.dataset_name = dataset_name
-		self.data_model = dataset_name + model_name
-		self.framework = 'keras'
-
-		# if not train:
-			# K.set_learning_phase(0)
-
-		print('Constructing network...')
-		self.input_ph, self.preds, self.grads, self.approxs, self.sess, self.model, self.num_classes, self.logits = construct_original_network(self.dataset_name, self.model_name, train = train)
-
-
-		self.layers = self.model.layers
-		self.last_hidden_layer = self.model.layers[-3]
-
-		self.y_ph = tf.placeholder(tf.float32, shape = [None, self.num_classes])
-		if load:
-			if load == True:
-				print('Loading model weights...')
-				self.model.load_weights('{}/models/original.hdf5'.format(self.data_model), 
-					by_name=True)
-			elif load != False:
-				self.model.load_weights('{}/models/{}.hdf5'.format(self.data_model, load), 
-					by_name=True)
-
-		self.pred_counter = 0
-
-	def train(self, dataset): 
-		print('Training...')
-		if self.dataset_name == 'mnist':
-			assert self.model_name in ['cnn', 'scnn']
-			data_model = self.dataset_name + self.model_name
-			filepath="{}/models/original.hdf5".format(data_model)
-			checkpoint = ModelCheckpoint(filepath, monitor='val_acc', 
-				verbose=1, save_best_only=True, mode='max')
-			callbacks_list = [checkpoint]
-			history = self.model.fit(dataset.x_train, dataset.y_train, 
-				validation_data=(dataset.x_val, dataset.y_val),
-				callbacks = callbacks_list, 
-				epochs=100, batch_size=128)
-			# print(history.history)
-		elif self.dataset_name in ['cifar10', 'cifar100']:
-			from keras.preprocessing.image import ImageDataGenerator
-
-			if self.model_name == 'cnn':
-				datagen = ImageDataGenerator(zoom_range=0.2, horizontal_flip=True)
-				# zoom 0.2
-				datagen = create_resnet_generator(dataset.x_train)
-				callbacks_list = []
-				batch_size = 128
-				num_epochs = 200
-
-			elif self.model_name in ['resnet', 'densenet']:
-				from resnet import lr_schedule, create_resnet_generator
-				from keras.callbacks import LearningRateScheduler, ReduceLROnPlateau, EarlyStopping
-				# zoom 0.2 horizontal_filp always True. change optimizer to sgd, and batch_size to 128. 
-				datagen = ImageDataGenerator(rotation_range=15,
-                               width_shift_range=5./32,
-                               height_shift_range=5./32,
-                               horizontal_flip = True,
-                               zoom_range = 0.2)
-
-				datagen.fit(dataset.x_train, seed=0)
-
-				from resnet import lr_schedule_sgd
-				from keras.callbacks import LearningRateScheduler
-				lr_scheduler = LearningRateScheduler(lr_schedule_sgd)
-				callbacks_list = [lr_scheduler]
-				batch_size = 128 if self.dataset_name == 'cifar10' else 64
-				num_epochs = 200
-
-			filepath="{}/models/original.hdf5".format(self.data_model)
-			checkpoint = ModelCheckpoint(filepath, monitor='val_acc', 
-				verbose=1, save_best_only=True, mode='max')
-			callbacks_list.append(checkpoint)
-
-			
-			model_info = self.model.fit_generator(datagen.flow(dataset.x_train, 
-				dataset.y_train, batch_size = batch_size),
-				epochs = num_epochs,
-				steps_per_epoch = dataset.x_train.shape[0] // batch_size,
-				callbacks = callbacks_list, 
-				validation_data = (dataset.x_val, dataset.y_val), 
-				verbose = 2,
-				workers = 4)
-
-	def adv_train(self, dataset, attack_name):
-		from cleverhans.attacks import FastGradientMethod, ProjectedGradientDescent
-		from cleverhans.utils_keras import KerasModelWrapper
-		from cleverhans.loss import CrossEntropy
-		from cleverhans.train import train
-		from cleverhans.utils_tf import model_eval
-		import time, datetime
-
-		if attack_name == 'fgsm' and self.dataset_name == 'mnist':
-			wrap = KerasModelWrapper(self.model)
-			params = {'eps': 0.3,
-				'clip_min': -1.,
-				'clip_max': 1.}
-
-			attacker = FastGradientMethod(wrap, sess=self.sess)
-			def attack(x):
-				return attacker.generate(x, **params)
-
-			preds_adv = self.model(attack(self.input_ph))
-			loss = CrossEntropy(wrap, smoothing=0.1, attack=attack)
-
-			y_ph = tf.placeholder(tf.float32, shape = (None, self.num_classes))
-
-			def evaluate():
-				# Accuracy of adversarially trained model on legitimate test inputs
-				eval_params = {'batch_size': 128}
-				accuracy = model_eval(self.sess, self.input_ph, y_ph, self.preds, dataset.x_val, dataset.y_val, args=eval_params)
-				print('Test accuracy on legitimate examples: %0.4f' % accuracy)
-
-				# Accuracy of the adversarially trained model on adversarial examples
-				accuracy = model_eval(self.sess, self.input_ph, y_ph, preds_adv, dataset.x_val, dataset.y_val, args=eval_params)
-				print('Test accuracy on adversarial examples: %0.4f' % accuracy)
-
-			# if self.dataset_name == 'mnist':
-			train_params = {
-				'nb_epochs': 20,
-				'batch_size': 128,
-				'learning_rate': 0.001,
-				'train_dir': '{}/models'.format(self.data_model),
-				'filename': 'adv.cpkt'
-			}
-
-			# Perform and evaluate adversarial training
-			train(self.sess, loss, dataset.x_train, dataset.y_train, evaluate=evaluate,
-				args=train_params, rng=np.random.RandomState([2017, 8, 30]))
-
-			self.model.save_weights('{}/models/{}.hdf5'.format(self.data_model, 'adv-{}'.format(attack_name)))
-
-		elif attack_name == 'pgd':
-			if self.dataset_name == 'mnist':
-				params = {'eps': 0.1,
-							# 'clip_min': -1.0,
-							# 'clip_max': 1.0,
-							'eps_iter': 0.01,
-							'nb_iter': 20,
-							'epochs': 100,
-							'batch_size': 50,
-							}
-			elif self.dataset_name == 'cifar10':
-				params = {'eps': 8.0 / 255 * 2,
-							# 'clip_min': -1.0,
-							# 'clip_max': 1.0,
-							'eps_iter': 2.0 / 255 * 2,
-							'nb_iter': 10,#10,#1,
-							'epochs': 200,
-							'batch_size': 128,
-							}				
-
-			# attacker = ProjectedGradientDescent(wrap, sess=self.sess)
-
-			# import foolbox
-			# from foolbox.attacks import ProjectedGradientDescentAttack
-			from attack_model import LinfPGDAttack
-			# Main training loop
-			# fmodel = foolbox.models.KerasModel(self.model, bounds=(-1, 1), preprocessing=(0, 1))
-			attacker = LinfPGDAttack(self, params['eps'], k = params['nb_iter'], a = params['eps_iter'], clip_min = dataset.clip_min, clip_max = dataset.clip_max, 
-				random_start = True, loss_func = 'xent')
-
-			def attack(x, y):
-				# return attacker(x, label=label, unpack=True, binary_search=False, epsilon=params['eps'], stepsize=params['eps_iter'], 
-				# 	iterations=params['nb_iter'], 
-				# 	random_start=False, return_early=True)
-				return attacker.attack(x, np.argmax(y, axis = -1))
-
-			from resnet import lr_schedule, create_resnet_generator,  lr_schedule_sgd
-			from keras.preprocessing.image import ImageDataGenerator
-
-			# datagen = create_resnet_generator(dataset.x_train)
-			datagen = ImageDataGenerator(rotation_range=15,
-				width_shift_range=5./32,
-				height_shift_range=5./32,
-				horizontal_flip = True,
-				zoom_range = 0.2)
-
-			datagen.fit(dataset.x_train, seed=0)
-
-			xent = tf.reduce_mean(K.categorical_crossentropy(self.y_ph, self.preds), name='y_xent')
-
-
-			global_step = tf.train.get_or_create_global_step()
-
-			if self.dataset_name == 'cifar10':
-				momentum = 0.9
-				weight_decay = 0.0002
-				costs = []
-				print('number of trainable variables: ',len(tf.trainable_variables()))
-				for var in tf.trainable_variables():
-					if 'kernel' in var.name:
-						costs.append(tf.nn.l2_loss(var))
-				penalty = tf.add_n(costs)
-
-				loss = xent + weight_decay * penalty
-			elif self.dataset_name == 'mnist':
-				loss = xent
-
-
-			if self.dataset_name == 'cifar10':
-				boundaries = [40000,60000]
-				values = [0.1,0.01,0.001]
-				learning_rate = tf.train.piecewise_constant(
-					tf.cast(global_step, tf.int32),
-					boundaries,
-					values)
-				optimizer = tf.train.MomentumOptimizer(learning_rate, momentum)
-			elif self.dataset_name == 'mnist':
-				boundaries = [50000]
-				values = [1e-3,1e-4]
-				learning_rate = tf.train.piecewise_constant(
-					tf.cast(global_step, tf.int32),
-					boundaries,
-					values)
-				optimizer = tf.train.AdamOptimizer(learning_rate)
-
-			train_step = optimizer.minimize(loss, global_step=global_step)
-
-
-			accuracy = tf.reduce_mean(tf.cast(tf.equal(tf.argmax(self.preds, 1), 
-				tf.argmax(self.y_ph, 1)), tf.float32))
-
-			num_output_steps = 100 # 100
-			num_checkpoint_steps = 1000
-			batch_size = params['batch_size']
-			ii = 0
-			epochs = params['epochs']
-
-			for e in range(epochs):
-				num_batches = 0
-				for x_batch, y_batch in datagen.flow(dataset.x_train, dataset.y_train, batch_size=batch_size):
-
-					# Compute Adversarial Perturbations
-					start = time.time()
-
-					x_batch_adv = attack(x_batch, y_batch)
-
-					nat_dict = {self.input_ph: x_batch,
-					            self.y_ph: y_batch}
-
-					adv_dict = {self.input_ph: x_batch_adv,
-					            self.y_ph: y_batch}
-					eval_dict = {self.input_ph: dataset.x_train[:1000],
-					            self.y_ph: dataset.y_train[:1000]}
-					val_dict = {self.input_ph: dataset.x_val[:1000],
-					            self.y_ph: dataset.y_val[:1000]}
-					# Output to stdout
-					if ii % num_output_steps == 0:
-						nat_acc = self.sess.run(accuracy, feed_dict=eval_dict)
-						val_acc = self.sess.run(accuracy, feed_dict=val_dict)
-						adv_acc = self.sess.run(accuracy, feed_dict=adv_dict)
-
-						print('Step {} '.format(ii))
-						print('    training nat accuracy {:.4}%'.format(nat_acc * 100))
-						print('    validation accuracy {:.4}%'.format(val_acc * 100))
-						print('    training adv accuracy {:.4}%'.format(adv_acc * 100))
-
-						if ii != 0:
-							print('    {} examples per second'.format(
-							num_output_steps * batch_size / training_time))
-							training_time = 0.0
-
-
-					# Write a checkpoint
-					if ii % num_checkpoint_steps == 0:
-						self.model.save_weights('{}/models/adv-{}-{}.hdf5'.format(self.data_model, attack_name, ii))
-
-					# Actual training step
-					
-					_ = self.sess.run(train_step, feed_dict=adv_dict)
-					# print(step)
-					end = time.time()
-					training_time = end - start
-					ii += 1
-					num_batches += 1
-
-					if num_batches >= len(dataset.x_train) / batch_size:
-						break
-
-			self.model.save_weights('{}/models/adv-{}.hdf5'.format(self.data_model, attack_name))
-
-
-
-	def predict(self, x, verbose=0, batch_size = 500, logits = False):
-		x = np.array(x)
-		if len(x.shape) == 3:
-			_x = np.expand_dims(x, 0) 
-		else:
-			_x = x
-
-		self.pred_counter += len(_x)
-			
-		if not logits:
-			prob = self.model.predict(_x, batch_size = batch_size, 
-			verbose = verbose)
-		else:
-			num_iters = int(math.ceil(len(_x) * 1.0 / batch_size))
-			probs = []
-			for i in range(num_iters):
-				# print('{} samples predicted'.format(i * batch_size))
-				x_batch = _x[i * batch_size: (i+1) * batch_size]
-
-				prob = self.sess.run(self.logits, 
-					feed_dict = {self.input_ph: x_batch})
-
-				probs.append(prob)
-				
-			prob = np.concatenate(probs, axis = 0)
-
-		if len(x.shape) == 3:
-			prob = prob.reshape(-1)
-
-		return prob
-
-	def compute_saliency(self, x, saliency_type = 'gradient'):
-		x = np.array(x)
-		if self.dataset_name in ['mnist', 'cifar10', 'cifar100']:
-			batchsize = 128 #if self.data in ['imdbcnn','imdblstm'] else 20
-			num_iters = int(math.ceil(len(x) * 1.0 / batchsize))
-			approxs_val = []
-
-			for i in range(num_iters): 
-				batch_data = x[i * batchsize: (i+1) * batchsize]
-
-				if saliency_type == 'gradient':
-					approxs = self.grads
-
-				elif saliency_type == 'taylor':
-					approxs = self.approxs
-
-				batch_approxs = self.sess.run(approxs, feed_dict = {self.input_ph: batch_data}) 
-				# [num_classes, batchsize, h, w, c]
-				approxs_val.append(batch_approxs) 
-
-			approxs_val = np.concatenate(approxs_val, axis = 1)
-			# [num_classes, num_data, h, w, c]
-
-			pred_val = self.predict(x)
-			
-			class_specific_scores = approxs_val[np.argmax(pred_val, axis = 1), range(len(pred_val))]
-			# [num_data, h, w, c]
-
-			return class_specific_scores
-
-	def compute_ig(self, x, reference):
-		x = np.array(x)
-		if self.dataset_name in ['mnist', 'cifar10', 'cifar100']:
-			batchsize = 1
-			steps = 50
-
-			pred_vals = self.predict(x)
-			class_specific_scores = []
-
-			num_iters = int(math.ceil(len(x) * 1.0 / batchsize))
-			for i in range(num_iters): 
-				batch_data = x[i * batchsize: (i+1) * batchsize] 
-				_, h, w, c = batch_data.shape
-				step_batch = [batch_data * float(s) / steps + reference * (1 - float(s) / steps) for s in range(1, steps+1)] 
-				# [steps,batchsize, h, w, c]
-
-				step_batch = np.reshape(step_batch, 
-						[-1, h, w, c])
-				# [steps * batchsize, h, w, c]
-
-				batch_grads = self.sess.run(self.grads,
-					feed_dict = {self.input_ph: step_batch})
-				# [num_classes, steps * batchsize, h, w, c]
-				num_classes, _, h, w, c = batch_grads.shape
-				grads_val = np.mean(batch_grads.reshape([num_classes, steps, -1, h, w, c]), axis = 1)
-				approxs_val = grads_val * (batch_data - reference)
-				# [num_classes, batchsize, h, w, c]
-
-				pred_val = pred_vals[i * batchsize: (i+1) * batchsize]
-				class_specific_score = approxs_val[np.argmax(pred_val, axis = 1), range(len(pred_val))]
-				# [batchsize, h, w, c]
-
-				# [batchsize, maxlen]
-				class_specific_scores.append(class_specific_score)
- 
-			# [num_data, length]
-			return np.concatenate(class_specific_scores, axis = 0)
-
-
-
-
-
-
-
-
-
-
-
-
-
+import time
+
+#############################################
+# 网络模型定义
+#############################################
+
+# SCNN: 两层卷积+池化，接全连接
+class SCNN(nn.Module):
+    def __init__(self, input_size=28, channel=1, num_classes=10):
+        super(SCNN, self).__init__()
+        self.conv1 = nn.Conv2d(channel, 32, kernel_size=5, padding=2)  # 'same' padding
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=5, padding=2)
+        self.fc1 = nn.Linear(64 * (input_size // 4) * (input_size // 4), 1024)
+        self.fc2 = nn.Linear(1024, num_classes)
+    
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.max_pool2d(x, 2)  # 降采样
+        x = F.relu(self.conv2(x))
+        x = F.max_pool2d(x, 2)
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        logits = self.fc2(x)
+        output = F.softmax(logits, dim=1)
+        return output, logits  # 返回 softmax 后的概率和 logits
+
+# CNN: 类似 Keras 版本的较深卷积网络
+class CNN(nn.Module):
+    def __init__(self, input_size=32, channel=3, num_classes=10):
+        super(CNN, self).__init__()
+        self.conv1 = nn.Conv2d(channel, 48, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(48, 48, kernel_size=3)  # 无 padding
+        self.conv3 = nn.Conv2d(48, 96, kernel_size=3, padding=1)
+        self.conv4 = nn.Conv2d(96, 96, kernel_size=3)  # 无 padding
+        self.conv5 = nn.Conv2d(96, 192, kernel_size=3, padding=1)
+        self.conv6 = nn.Conv2d(192, 192, kernel_size=3)  # 无 padding
+        
+        self.dropout1 = nn.Dropout(0.25)
+        self.dropout2 = nn.Dropout(0.25)
+        self.dropout3 = nn.Dropout(0.25)
+        self.dropout_fc1 = nn.Dropout(0.5)
+        self.dropout_fc2 = nn.Dropout(0.5)
+        
+        # 根据卷积和池化计算展平后的尺寸，这里采用经验值，可根据实际输入调整
+        self.fc1 = nn.Linear(192 * 2 * 2, 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, num_classes)
+        
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.max_pool2d(x, 2)
+        x = self.dropout1(x)
+        x = F.relu(self.conv3(x))
+        x = F.relu(self.conv4(x))
+        x = F.max_pool2d(x, 2)
+        x = self.dropout2(x)
+        x = F.relu(self.conv5(x))
+        x = F.relu(self.conv6(x))
+        x = F.max_pool2d(x, 2)
+        x = self.dropout3(x)
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        x = self.dropout_fc1(x)
+        x = F.relu(self.fc2(x))
+        x = self.dropout_fc2(x)
+        logits = self.fc3(x)
+        output = F.softmax(logits, dim=1)
+        return output, logits
+
+# FC: 全连接网络
+class FC(nn.Module):
+    def __init__(self, input_size=28, channel=1, num_classes=10):
+        super(FC, self).__init__()
+        self.input_dim = input_size * input_size * channel
+        self.fc1 = nn.Linear(self.input_dim, 256)
+        self.fc2 = nn.Linear(256, 256)
+        self.fc3 = nn.Linear(256, 256)
+        self.fc4 = nn.Linear(256, num_classes)
+    
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        logits = self.fc4(x)
+        output = F.softmax(logits, dim=1)
+        return output, logits
+
+#############################################
+# 网络构造函数（可根据 dataset_name 和 model_name 选择模型）
+#############################################
+def construct_original_network(dataset_name, model_name, train=True):
+    if dataset_name.lower() == 'mnist':
+        input_size = 28
+        num_classes = 10
+        channel = 1
+    elif dataset_name.lower() in ['cifar10', 'cifar100']:
+        input_size = 32
+        num_classes = 10 if dataset_name.lower() == 'cifar10' else 100
+        channel = 3
+    else:
+        raise ValueError("Unsupported dataset")
+    
+    if model_name.lower() == 'scnn':
+        model = SCNN(input_size, channel, num_classes)
+    elif model_name.lower() == 'cnn':
+        model = CNN(input_size, channel, num_classes)
+    elif model_name.lower() == 'fc':
+        model = FC(input_size, channel, num_classes)
+    # 对于 resnet 和 densenet 可考虑调用 torchvision.models 进行加载
+    else:
+        raise ValueError("Unsupported model")
+    
+    return model, input_size, num_classes
+
+#############################################
+# ImageModel 类（封装模型训练、对抗训练、预测、梯度计算等功能）
+#############################################
+class ImageModel:
+    def __init__(self, model_name, dataset_name, train=False, load_path=None, device=None):
+        self.model_name = model_name
+        self.dataset_name = dataset_name
+        self.framework = 'pytorch'
+        self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        print('Constructing network...')
+        self.model, self.input_size, self.num_classes = construct_original_network(dataset_name, model_name, train=train)
+        self.model = self.model.to(self.device)
+        
+        if load_path is not None:
+            print("Loading model weights from {}".format(load_path))
+            self.model.load_state_dict(torch.load(load_path, map_location=self.device))
+        
+        self.criterion = nn.CrossEntropyLoss()
+        # 优化器等在 train/adv_train 中构造
+        
+        self.pred_counter = 0
+
+    def train(self, train_dataset, val_dataset, epochs=20, batch_size=128, lr=0.001):
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+        
+        optimizer = optim.Adam(self.model.parameters(), lr=lr)
+        
+        for epoch in range(epochs):
+            self.model.train()
+            epoch_loss = 0.0
+            correct = 0
+            total = 0
+            for data, target in train_loader:
+                data, target = data.to(self.device), target.to(self.device)
+                optimizer.zero_grad()
+                # 输出：(_, logits)
+                _, logits = self.model(data)
+                loss = self.criterion(logits, target)
+                loss.backward()
+                optimizer.step()
+                
+                epoch_loss += loss.item() * data.size(0)
+                pred = logits.argmax(dim=1)
+                correct += pred.eq(target).sum().item()
+                total += data.size(0)
+            
+            train_loss = epoch_loss / total
+            train_acc = correct / total
+            print("Epoch [{}/{}] Train Loss: {:.4f}  Train Acc: {:.4f}".format(epoch+1, epochs, train_loss, train_acc))
+            
+            # 验证
+            self.model.eval()
+            correct_val = 0
+            total_val = 0
+            with torch.no_grad():
+                for data, target in val_loader:
+                    data, target = data.to(self.device), target.to(self.device)
+                    _, logits = self.model(data)
+                    pred = logits.argmax(dim=1)
+                    correct_val += pred.eq(target).sum().item()
+                    total_val += data.size(0)
+            val_acc = correct_val / total_val
+            print("Validation Acc: {:.4f}".format(val_acc))
+    
+    def adv_train(self, train_dataset, val_dataset, attack_name='fgsm', epochs=20, batch_size=128, lr=0.001, eps=0.3):
+        """
+        对抗训练示例，支持 FGSM 和 PGD（Linf）攻击。
+        这里使用简单的实现，您可以根据需要扩展。
+        """
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+        optimizer = optim.Adam(self.model.parameters(), lr=lr)
+        
+        def fgsm_attack(data, target, eps):
+            data.requires_grad = True
+            self.model.eval()
+            _, logits = self.model(data)
+            loss = self.criterion(logits, target)
+            self.model.zero_grad()
+            loss.backward()
+            # FGSM perturbation
+            data_grad = data.grad.data
+            perturbed_data = data + eps * data_grad.sign()
+            # clip to [0,1]
+            perturbed_data = torch.clamp(perturbed_data, 0, 1)
+            return perturbed_data
+        
+        def pgd_attack(data, target, eps, alpha=0.01, iters=10):
+            original_data = data.clone().detach()
+            perturbed_data = data.clone().detach()
+            for i in range(iters):
+                perturbed_data.requires_grad = True
+                self.model.eval()
+                _, logits = self.model(perturbed_data)
+                loss = self.criterion(logits, target)
+                self.model.zero_grad()
+                loss.backward()
+                grad = perturbed_data.grad.data
+                perturbed_data = perturbed_data + alpha * grad.sign()
+                # projection onto eps-ball
+                eta = torch.clamp(perturbed_data - original_data, min=-eps, max=eps)
+                perturbed_data = torch.clamp(original_data + eta, 0, 1).detach()
+            return perturbed_data
+        
+        for epoch in range(epochs):
+            self.model.train()
+            epoch_loss = 0.0
+            correct = 0
+            total = 0
+            for data, target in train_loader:
+                data, target = data.to(self.device), target.to(self.device)
+                # 生成对抗样本
+                if attack_name.lower() == 'fgsm':
+                    data_adv = fgsm_attack(data, target, eps)
+                elif attack_name.lower() == 'pgd':
+                    data_adv = pgd_attack(data, target, eps)
+                else:
+                    raise ValueError("Unsupported attack for adv_train")
+                
+                optimizer.zero_grad()
+                # 对抗训练使用对抗样本
+                _, logits = self.model(data_adv)
+                loss = self.criterion(logits, target)
+                loss.backward()
+                optimizer.step()
+                
+                epoch_loss += loss.item() * data.size(0)
+                pred = logits.argmax(dim=1)
+                correct += pred.eq(target).sum().item()
+                total += data.size(0)
+            
+            train_loss = epoch_loss / total
+            train_acc = correct / total
+            print("Adv Train Epoch [{}/{}] Loss: {:.4f}  Acc: {:.4f}".format(epoch+1, epochs, train_loss, train_acc))
+            
+            # 验证：分别计算原始和对抗样本上的准确率
+            self.model.eval()
+            correct_nat = 0
+            correct_adv = 0
+            total_val = 0
+            with torch.no_grad():
+                for data, target in val_loader:
+                    data, target = data.to(self.device), target.to(self.device)
+                    # 自然样本预测
+                    _, logits_nat = self.model(data)
+                    pred_nat = logits_nat.argmax(dim=1)
+                    correct_nat += pred_nat.eq(target).sum().item()
+                    # 对抗样本预测（使用 FGSM 生成对抗样本作为示例）\n                    data_adv = fgsm_attack(data, target, eps)  \n                    _, logits_adv = self.model(data_adv)\n                    pred_adv = logits_adv.argmax(dim=1)\n                    correct_adv += pred_adv.eq(target).sum().item()\n                    total_val += data.size(0)\n            print("Validation Nat Acc: {:.4f}  Adv Acc: {:.4f}".format(correct_nat/total_val, correct_adv/total_val))
+    
+    def predict(self, x, batch_size=500, logits=False):
+        """
+        x: numpy 数组，形状为 (N, H, W) 或 (N, H, W, C)
+        """
+        self.model.eval()
+        if isinstance(x, np.ndarray):
+            # 根据数据维度做简单判断
+            if x.ndim == 3:
+                # (N, H, W) -> (N, 1, H, W)
+                x = np.expand_dims(x, axis=1)
+            elif x.ndim == 4 and x.shape[-1] in [1,3]:
+                # Keras 默认通道在最后，转换为 PyTorch 格式 (N, C, H, W)
+                x = np.transpose(x, (0, 3, 1, 2))
+            x_tensor = torch.from_numpy(x).float().to(self.device)
+        else:
+            x_tensor = x.to(self.device)
+        
+        preds = []
+        with torch.no_grad():
+            loader = DataLoader(x_tensor, batch_size=batch_size)
+            for batch in loader:
+                out, out_logits = self.model(batch)
+                if logits:
+                    preds.append(out_logits.cpu().numpy())
+                else:
+                    preds.append(out.cpu().numpy())
+        preds = np.concatenate(preds, axis=0)
+        self.pred_counter += preds.shape[0]
+        return preds
+    
+    def compute_saliency(self, x, saliency_type='gradient'):
+        """
+        计算输入 x 的 saliency 图，这里仅支持 gradient 方式。
+        x: numpy 数组，形状 (N, H, W) 或 (N, H, W, C)
+        返回与 x 相同 shape 的梯度绝对值。
+        """
+        self.model.eval()
+        if isinstance(x, np.ndarray):
+            if x.ndim == 3:
+                x = np.expand_dims(x, axis=1)
+            elif x.ndim == 4 and x.shape[-1] in [1,3]:
+                x = np.transpose(x, (0, 3, 1, 2))
+            x_tensor = torch.from_numpy(x).float().to(self.device)
+        else:
+            x_tensor = x.to(self.device)
+        
+        x_tensor.requires_grad = True
+        out, logits = self.model(x_tensor)
+        # 取预测类别对应的 logits
+        preds = logits.argmax(dim=1)
+        loss = self.criterion(logits, preds)
+        self.model.zero_grad()
+        loss.backward()
+        # saliency 为输入梯度的绝对值
+        saliency = x_tensor.grad.data.abs().cpu().numpy()
+        # 如需要，可转回原来的通道顺序
+        if saliency.shape[1] in [1,3]:
+            saliency = np.transpose(saliency, (0, 2, 3, 1))
+        return saliency
+
+    def compute_ig(self, x, reference, steps=50):
+        """
+        简单实现 Integrated Gradients 算法
+        x: numpy 数组 (N, H, W, C) 或 (N, C, H, W)
+        reference: 同 x 尺寸的基准图（例如全0图像）
+        """
+        self.model.eval()
+        if isinstance(x, np.ndarray):
+            # 如果输入为 (N, H, W, C)，转换为 (N, C, H, W)
+            if x.ndim == 4 and x.shape[-1] in [1,3]:
+                x_tensor = torch.from_numpy(np.transpose(x, (0, 3, 1, 2))).float().to(self.device)
+            else:
+                x_tensor = torch.from_numpy(x).float().to(self.device)
+            if reference is None:
+                reference = torch.zeros_like(x_tensor)
+            else:
+                if isinstance(reference, np.ndarray):
+                    if reference.ndim == 4 and reference.shape[-1] in [1,3]:
+                        reference = torch.from_numpy(np.transpose(reference, (0, 3, 1, 2))).float().to(self.device)
+                    else:
+                        reference = torch.from_numpy(reference).float().to(self.device)
+        else:
+            x_tensor = x.to(self.device)
+            reference = reference.to(self.device)
+        
+        # 构造渐进序列
+        scaled_inputs = [reference + (float(i) / steps) * (x_tensor - reference) for i in range(1, steps+1)]
+        ig = torch.zeros_like(x_tensor)
+        
+        for scaled in scaled_inputs:
+            scaled.requires_grad = True
+            out, logits = self.model(scaled)
+            preds = logits.argmax(dim=1)
+            loss = self.criterion(logits, preds)
+            self.model.zero_grad()
+            loss.backward()
+            ig += scaled.grad.data
+        
+        # 平均后乘以 (x - reference)
+        ig = (x_tensor - reference) * ig / steps
+        # 转为 numpy，并恢复通道顺序为 (N, H, W, C)
+        ig = ig.cpu().numpy()
+        ig = np.transpose(ig, (0, 2, 3, 1))
+        return ig
 
 
