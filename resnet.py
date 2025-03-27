@@ -1,280 +1,246 @@
-"""Trains a ResNet on the CIFAR10 dataset.
-
-ResNet v1
-[a] Deep Residual Learning for Image Recognition
-https://arxiv.org/pdf/1512.03385.pdf
-
-ResNet v2
-[b] Identity Mappings in Deep Residual Networks
-https://arxiv.org/pdf/1603.05027.pdf
-"""
-
-from __future__ import print_function
-import keras
-from keras.layers import Dense, Conv2D, BatchNormalization, Activation
-from keras.layers import AveragePooling2D, Input, Flatten
-from keras.optimizers import Adam
-from keras.callbacks import ModelCheckpoint, LearningRateScheduler
-from keras.callbacks import ReduceLROnPlateau
-from keras.preprocessing.image import ImageDataGenerator
-from keras.regularizers import l2
-from keras import backend as K
-from keras.models import Model
-from keras.datasets import cifar10
-import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+from torch.optim.lr_scheduler import LambdaLR
+import math
 import os
 
+# --------------------------
+# ResNet v2 (Bottleneck) 模型定义
+# --------------------------
+class BottleneckBlock(nn.Module):
+    expansion = 4
 
+    def __init__(self, in_planes, planes, stride=1, downsample=None):
+        super(BottleneckBlock, self).__init__()
+        # ResNet v2 在每个 block 内采用 BN-ReLU-Conv 顺序
+        self.bn1 = nn.BatchNorm2d(in_planes)
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride,
+                               padding=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(planes)
+        self.conv3 = nn.Conv2d(planes, planes * self.expansion, kernel_size=1, bias=False)
+        self.downsample = downsample
+        self.stride = stride
 
+    def forward(self, x):
+        identity = x
+
+        out = self.bn1(x)
+        out = F.relu(out)
+        # 若需要下采样，则在第一层进行
+        out = self.conv1(out)
+
+        out = self.bn2(out)
+        out = F.relu(out)
+        out = self.conv2(out)
+
+        out = self.bn3(out)
+        out = F.relu(out)
+        out = self.conv3(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        return out
+
+class ResNetV2(nn.Module):
+    def __init__(self, block, layers, num_classes=10):
+        super(ResNetV2, self).__init__()
+        self.in_planes = 16
+
+        # CIFAR10 的输入尺寸为 32x32，最初 conv 层不下采样
+        self.conv1 = nn.Conv2d(3, self.in_planes, kernel_size=3, stride=1,
+                               padding=1, bias=False)
+        # 这里不加 BN+ReLU 在最开始，ResNet v2 在前面加了一个预处理层 BN-ReLU
+        self.bn1 = nn.BatchNorm2d(self.in_planes)
+        self.relu = nn.ReLU(inplace=True)
+
+        # 三个 stage，输出通道依次扩展
+        self.layer1 = self._make_layer(block, 16, layers[0], stride=1)
+        self.layer2 = self._make_layer(block, 32, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, 64, layers[2], stride=2)
+
+        self.bn_last = nn.BatchNorm2d(self.in_planes)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(self.in_planes, num_classes)
+
+        # 初始化权重
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+
+    def _make_layer(self, block, planes, blocks, stride):
+        downsample = None
+        # 第一层 block 如果步长不为1或者输入通道不等于输出通道时需要下采样
+        if stride != 1 or self.in_planes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.in_planes, planes * block.expansion, kernel_size=1,
+                          stride=stride, bias=False)
+            )
+
+        layers = []
+        layers.append(block(self.in_planes, planes, stride, downsample))
+        self.in_planes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.in_planes, planes))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        # 输入 x: (N, 3, 32, 32)
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+
+        x = self.bn_last(x)
+        x = self.relu(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        out = self.fc(x)
+        return out
+
+def resnet_v2_cifar(depth, num_classes=10):
+    # depth 应满足: depth = 9n + 2, n 为整数
+    if (depth - 2) % 9 != 0:
+        raise ValueError("depth should be 9n+2 (e.g., 56, 110)")
+    n = (depth - 2) // 9
+    layers = [n, n, n]
+    model = ResNetV2(BottleneckBlock, layers, num_classes=num_classes)
+    return model
+
+# --------------------------
+# 学习率调度函数（仿照 Keras 版本）
+# --------------------------
 def lr_schedule(epoch):
-	"""Learning Rate Schedule
+    lr = 1e-3
+    if epoch > 180:
+        lr *= 0.5e-3
+    elif epoch > 160:
+        lr *= 1e-3
+    elif epoch > 120:
+        lr *= 1e-2
+    elif epoch > 80:
+        lr *= 1e-1
+    print("Learning rate:", lr)
+    return lr
 
-	Learning rate is scheduled to be reduced after 80, 120, 160, 180 epochs.
-	Called automatically every epoch as part of callbacks during training.
+# --------------------------
+# 数据增强与数据加载
+# --------------------------
+def get_dataloaders(batch_size=128):
+    transform_train = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        # CIFAR10 数据集已归一化到 [0,1]
+    ])
 
-	# Arguments
-		epoch (int): The number of epochs
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+    ])
 
-	# Returns
-		lr (float32): learning rate
-	"""
-	lr = 1e-3
-	if epoch > 180:
-		lr *= 0.5e-3
-	elif epoch > 160:
-		lr *= 1e-3
-	elif epoch > 120:
-		lr *= 1e-2
-	elif epoch > 80:
-		lr *= 1e-1
-	print('Learning rate: ', lr)
-	return lr
+    trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True,
+                                            transform=transform_train)
+    trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size,
+                                              shuffle=True, num_workers=2)
 
+    testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True,
+                                           transform=transform_test)
+    testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size,
+                                             shuffle=False, num_workers=2)
+    return trainloader, testloader
 
-def lr_schedule_cifar100(epoch):
-	"""Learning Rate Schedule
+# --------------------------
+# 训练与验证
+# --------------------------
+def train(model, device, trainloader, optimizer, criterion):
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
 
-	Learning rate is scheduled to be reduced after 80, 120, 160, 180 epochs.
-	Called automatically every epoch as part of callbacks during training.
+    for inputs, targets in trainloader:
+        inputs, targets = inputs.to(device), targets.to(device)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        optimizer.step()
 
-	# Arguments
-		epoch (int): The number of epochs
+        running_loss += loss.item() * inputs.size(0)
+        _, predicted = outputs.max(1)
+        total += targets.size(0)
+        correct += predicted.eq(targets).sum().item()
+    epoch_loss = running_loss / total
+    epoch_acc = correct / total
+    return epoch_loss, epoch_acc
 
-	# Returns
-		lr (float32): learning rate
-	"""
-	lr = 1e-4
-	if epoch > 180:
-		lr *= 0.5e-3
-	elif epoch > 160:
-		lr *= 1e-3
-	elif epoch > 120:
-		lr *= 1e-2
-	elif epoch > 80:
-		lr *= 1e-1
-	print('Learning rate: ', lr)
-	return lr
+def validate(model, device, testloader, criterion):
+    model.eval()
+    running_loss = 0.0
+    correct = 0
+    total = 0
 
-def lr_schedule_sgd(epoch):
-	decay = epoch >= 122 and 2 or epoch >= 81 and 1 or 0
-	lr = 1e-1 * 0.1 ** decay
-	print('Learning rate: ', lr)
-	return lr	
+    with torch.no_grad():
+        for inputs, targets in testloader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            running_loss += loss.item() * inputs.size(0)
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+    epoch_loss = running_loss / total
+    epoch_acc = correct / total
+    return epoch_loss, epoch_acc
 
-def resnet_layer(inputs,
-				 num_filters=16,
-				 kernel_size=3,
-				 strides=1,
-				 activation='relu',
-				 batch_normalization=True,
-				 conv_first=True):
-	"""2D Convolution-Batch Normalization-Activation stack builder
+# --------------------------
+# 主函数
+# --------------------------
+def main():
+    # 超参数设置
+    depth = 110  # 例如：110, 确保满足 9n+2
+    num_classes = 10
+    batch_size = 128
+    num_epochs = 200
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-	# Arguments
-		inputs (tensor): input tensor from input image or previous layer
-		num_filters (int): Conv2D number of filters
-		kernel_size (int): Conv2D square kernel dimensions
-		strides (int): Conv2D square stride dimensions
-		activation (string): activation name
-		batch_normalization (bool): whether to include batch normalization
-		conv_first (bool): conv-bn-activation (True) or
-			bn-activation-conv (False)
+    # 创建模型
+    model = resnet_v2_cifar(depth, num_classes=num_classes)
+    model = model.to(device)
 
-	# Returns
-		x (tensor): tensor as input to the next layer
-	"""
-	conv = Conv2D(num_filters,
-				  kernel_size=kernel_size,
-				  strides=strides,
-				  padding='same',
-				  kernel_initializer='he_normal',
-				  kernel_regularizer=l2(1e-4))
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
-	x = inputs
-	if conv_first:
-		x = conv(x)
-		if batch_normalization:
-			x = BatchNormalization()(x)
-		if activation is not None:
-			x = Activation(activation)(x)
-	else:
-		if batch_normalization:
-			x = BatchNormalization()(x)
-		if activation is not None:
-			x = Activation(activation)(x)
-		x = conv(x)
-	return x
+    # 学习率调度（使用 LambdaLR，每个 epoch 更新）
+    scheduler = LambdaLR(optimizer, lr_lambda=lambda epoch: lr_schedule(epoch)/1e-3)
 
+    trainloader, testloader = get_dataloaders(batch_size)
 
-def resnet_v2(input_shape, depth, num_classes=10):
-	"""ResNet Version 2 Model builder [b]
+    best_acc = 0.0
+    save_dir = "./checkpoints"
+    os.makedirs(save_dir, exist_ok=True)
 
-	Stacks of (1 x 1)-(3 x 3)-(1 x 1) BN-ReLU-Conv2D or also known as
-	bottleneck layer
-	First shortcut connection per layer is 1 x 1 Conv2D.
-	Second and onwards shortcut connection is identity.
-	At the beginning of each stage, the feature map size is halved (downsampled)
-	by a convolutional layer with strides=2, while the number of filter maps is
-	doubled. Within each stage, the layers have the same number filters and the
-	same filter map sizes.
-	Features maps sizes:
-	conv1  : 32x32,  16
-	stage 0: 32x32,  64
-	stage 1: 16x16, 128
-	stage 2:  8x8,  256
+    for epoch in range(num_epochs):
+        train_loss, train_acc = train(model, device, trainloader, optimizer, criterion)
+        val_loss, val_acc = validate(model, device, testloader, criterion)
+        scheduler.step()
 
-	# Arguments
-		input_shape (tensor): shape of input image tensor
-		depth (int): number of core convolutional layers
-		num_classes (int): number of classes (CIFAR10 has 10)
+        print("Epoch [{}/{}] Train Loss: {:.4f}  Train Acc: {:.4f}  Val Loss: {:.4f}  Val Acc: {:.4f}".format(
+            epoch+1, num_epochs, train_loss, train_acc, val_loss, val_acc))
+        # 保存最优模型
+        if val_acc > best_acc:
+            best_acc = val_acc
+            torch.save(model.state_dict(), os.path.join(save_dir, "resnet_v2_best.pth"))
 
-	# Returns
-		model (Model): Keras model instance
-	"""
-	if (depth - 2) % 9 != 0:
-		raise ValueError('depth should be 9n+2 (eg 56 or 110 in [b])')
-	# Start model definition.
-	num_filters_in = 16
-	num_res_blocks = int((depth - 2) / 9)
-
-	inputs = Input(shape=input_shape)
-	# v2 performs Conv2D with BN-ReLU on input before splitting into 2 paths
-	x = resnet_layer(inputs=inputs,
-					 num_filters=num_filters_in,
-					 conv_first=True)
-
-	# Instantiate the stack of residual units
-	for stage in range(3):
-		for res_block in range(num_res_blocks):
-			activation = 'relu'
-			batch_normalization = True
-			strides = 1
-			if stage == 0:
-				num_filters_out = num_filters_in * 4
-				if res_block == 0:  # first layer and first stage
-					activation = None
-					batch_normalization = False
-			else:
-				num_filters_out = num_filters_in * 2
-				if res_block == 0:  # first layer but not first stage
-					strides = 2    # downsample
-
-			# bottleneck residual unit
-			y = resnet_layer(inputs=x,
-							 num_filters=num_filters_in,
-							 kernel_size=1,
-							 strides=strides,
-							 activation=activation,
-							 batch_normalization=batch_normalization,
-							 conv_first=False)
-
-			y = resnet_layer(inputs=y,
-							 num_filters=num_filters_in,
-							 conv_first=False)
-			y = resnet_layer(inputs=y,
-							 num_filters=num_filters_out,
-							 kernel_size=1,
-							 conv_first=False)
-			if res_block == 0:
-				# linear projection residual shortcut connection to match
-				# changed dims
-				x = resnet_layer(inputs=x,
-								 num_filters=num_filters_out,
-								 kernel_size=1,
-								 strides=strides,
-								 activation=None,
-								 batch_normalization=False)
-				
-			x = keras.layers.add([x, y])
-
-		num_filters_in = num_filters_out
-
-	# Add classifier on top.
-	# v2 has BN-ReLU before Pooling
-	x = BatchNormalization()(x)
-	x = Activation('relu')(x)
-	pool_size = int(x.get_shape()[1])
-	x = AveragePooling2D(pool_size=pool_size)(x)
-	y = Flatten()(x)
-	outputs = Dense(num_classes,
-					activation=None,
-					kernel_initializer='he_normal')(y)
-
-	outputs = Activation('softmax')(outputs)
-
-	# Instantiate model.
-	model = Model(inputs=inputs, outputs=outputs)
-	return model, inputs, outputs
-
-	
-
-def create_resnet_generator(x_train):
-	# This will do preprocessing and realtime data augmentation:
-	datagen = ImageDataGenerator(
-		# set input mean to 0 over the dataset
-		featurewise_center=False,
-		# set each sample mean to 0
-		samplewise_center=False,
-		# divide inputs by std of dataset
-		featurewise_std_normalization=False,
-		# divide each input by its std
-		samplewise_std_normalization=False,
-		# apply ZCA whitening
-		zca_whitening=False,
-		# epsilon for ZCA whitening
-		zca_epsilon=1e-06,
-		# randomly rotate images in the range (deg 0 to 180)
-		rotation_range=0,
-		# randomly shift images horizontally
-		width_shift_range=0.1,
-		# randomly shift images vertically
-		height_shift_range=0.1,
-		# set range for random shear
-		shear_range=0.,
-		# set range for random zoom
-		zoom_range=0.,
-		# set range for random channel shifts
-		channel_shift_range=0.,
-		# set mode for filling points outside the input boundaries
-		fill_mode='nearest',
-		# value used for fill_mode = "constant"
-		cval=0.,
-		# randomly flip images
-		horizontal_flip=True,
-		# randomly flip images
-		vertical_flip=False,
-		# set rescaling factor (applied before any other transformation)
-		rescale=None,
-		# set function that will be applied on each input
-		preprocessing_function=None,
-		# image data format, either "channels_first" or "channels_last"
-		data_format=None,
-		# fraction of images reserved for validation (strictly between 0 and 1)
-		validation_split=0.0)
-
-	# Compute quantities required for featurewise normalization
-	# (std, mean, and principal components if ZCA whitening is applied).
-	datagen.fit(x_train)
-	return datagen
-
-
+if __name__ == "__main__":
+    main()
